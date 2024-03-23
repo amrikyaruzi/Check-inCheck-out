@@ -1,0 +1,229 @@
+---
+title: "R Notebook"
+output: html_notebook
+---
+
+```{r warning=FALSE, message=FALSE, echo=FALSE}
+
+library(tidyverse)
+library(readxl)
+library(lubridate)
+library(janitor)
+library(ggtext)
+library(officer)
+library(gt)
+library(here)
+library(webshot2)
+library(glue)
+
+```
+
+
+
+```{r}
+path <- here("./Data") %>% list.files(pattern = ".xlsx$", full.names = TRUE) 
+data <- path %>%  excel_sheets() %>% set_names() %>% map_df(read_excel, path = path, .id = "sheet")
+```
+
+
+
+```{r}
+
+data1 <- data %>% mutate(across(.cols = c("DISCHARGE DATE", "CHECKED OUT", "CHECKED IN"),.fns = ymd_hms),
+                        MONTH = month(`DISCHARGE DATE`, abbr = FALSE, label = TRUE)) %>%
+  relocate(MONTH, .after = `DISCHARGE DATE`)
+
+
+```
+
+
+
+```{r}
+#data1 <- data1 %>% filter(MONTH == "December")
+```
+
+
+
+```{r}
+
+data1 <- data1 %>% filter(difftime(Sys.time(), `DISCHARGE DATE`, units = "hours") > 72)
+
+data1 <- data1 %>% mutate(Turnaroundtime = case_when(!is.na(`CHECKED IN`) ~ difftime(`CHECKED IN`, `DISCHARGE DATE`, units = "hours"),
+                                      is.na(`CHECKED IN`) ~ difftime(ymd_hms(Sys.time()), `DISCHARGE DATE`, units = "hours")))
+
+data1 <- data1 %>% mutate(compliance = case_when(Turnaroundtime <= 72 ~ "MET",
+                                                 Turnaroundtime > 72 ~ "NOT MET"))
+
+```
+
+
+
+```{r}
+
+data1 <- data1 %>% filter(`CHECKOUT LOCATION` %in% c("CATH LAB WARD", "PEDIATRICS WARD", "SURGERY DEPARTMENT", "MEDICINE DEPARTMENT ( THIRD FLOOR )", "MATERNITY WARD", "PRIVATE FLOOR", "MEDICINE DEPARTMENT ISOLATION", "ICU"))
+
+```
+
+
+
+```{r}
+
+data1 <- data1 %>% clean_names() %>% mutate_at("checkout_location", str_extract, "(\\w)*")
+
+
+data1 <- data1 %>% mutate(checkout_location =  gsub(x = checkout_location,
+                                                    pattern = "CATH",
+                                                    replacement = "Cathlab"),
+                          
+                          checkout_location = gsub(x = checkout_location,
+                                                   pattern = "PRIVATE",
+                                                   replacement = "Pavilion")) %>%
+  
+                   mutate(checkout_location = case_when(str_length(checkout_location) != 3 ~
+                                                          str_to_title(checkout_location),
+                     TRUE ~ checkout_location))
+
+data1 <- data1 %>% rename("department" = "checkout_location")
+
+```
+
+
+
+```{r}
+
+data2 <- data1 %>% group_by(month, department, compliance) %>% summarise(Count = n()) %>%
+  mutate(Percentage = (Count/sum(Count)) * 100) %>% mutate_at("Percentage", round_half_up, 1) %>% 
+  ungroup()
+
+data2_1 <- data2 %>% filter(compliance == "NOT MET" & Percentage == 100)
+data2 <- data2 %>% filter(compliance == "MET")
+data2_1 <- data2_1 %>% mutate(compliance = "MET",
+                              Count = 0L,
+                              Percentage = 0)
+
+  
+data2 <- rbind(data2, data2_1)
+rm(data2_1)
+  
+data2_totals <- data1 %>% group_by(month, department) %>% summarise(Total = n())
+
+data2 <-  data2 %>% left_join(data2_totals) %>% relocate(Total, .after = Count)
+
+data2 <- data2 %>% mutate(Category = case_when(Percentage >= 90 ~ "Above benchmark",
+                                   Percentage >= 50 & Percentage < 90 ~ "Below benchmark but above 50",
+                                   Percentage < 50 ~ "Below benchmark and below 50"))
+
+```
+
+
+
+```{r table}
+
+data3 <- data2 %>% select(month, department, Percentage) %>% pivot_wider(names_from = month, values_from = Percentage)
+
+graph_table <-  data3 %>% 
+  gt() %>% 
+  cols_label(department = md("**Ward/<br> Unit**")) %>%
+  
+  tab_spanner(label = md("**Month**"),
+              columns = -department) %>%
+  
+  tab_header(title = md("**Timeliness in returning discharge files to Medical Records**"),
+             subtitle = gt::html("<i>*Percentage of files that were returned within 72 hours of discharge. Darker shades of <span style='color:red'> red </span> represent values that are much lower than the benchmark <span style='color:gray; font-style:normal'>(100%)</span> for that particular month</i>")) %>%
+  data_color(columns = -department,
+              colors = scales::col_numeric(palette = c("red", "white"), domain = c(0, 100)
+             )) %>%
+  fmt_percent(columns = -department, scale_values = FALSE, decimals = 1) %>%
+  
+  bstfun::as_ggplot(zoom = 10)
+
+```
+
+
+
+```{r graph}
+
+
+graph <- ggplot(data = data2, aes(x = department, y = Percentage, fill = Category, label = Percentage)) + geom_col() + facet_wrap(~month, ncol = ifelse(n_distinct(unique(data2$month)) > 6, 6, n_distinct(unique(data2$month))), nrow = ifelse(n_distinct(unique(data2$month)) > 6, 2, 1)) + 
+    
+    theme(#plot.caption.position = "plot",
+          panel.grid.major.x = element_line(),
+          panel.grid.minor = element_line(),
+          plot.background = element_rect(fill = "white"), #gray98
+          plot.title = element_markdown(face = "plain"),
+          plot.subtitle = element_markdown(#face = "italic",
+              size = 10),
+          plot.caption = element_text(face = "italic"),
+          legend.position = "bottom",
+          axis.text.x = element_text(family = "Helvetica", angle = 90, vjust = 0.5, hjust = 1),
+          axis.text.y = element_text(family = "Helvetica"),
+          panel.background = element_rect(fill = "gray97"), #gray96 #white
+          axis.line = element_line()) +
+    
+    labs(title = "\nTimeliness in returning discharge files to Medical Records<br><i>Percentage of files that were returned within 72 hours of discharge</i>\n",
+         subtitle = " Numerator:  Discharge files that were returned to Medical Records within 72 hours of discharge<br> Denominator: Total number of discharge files >= 72 hours since discharge regardless of return status <br><br> Benchmark: <i>90%</i>",
+         x = "\nWard/ Unit", y = "\nCompliance (%)\n", caption = "Note: files that were checked out to these locations for reasons that are not patient-care related (e.g. for presentations) were excluded in the analysis."
+         #fill = "" #if we want to have a blank legend
+    ) + 
+    
+    guides(fill = guide_legend(title = "Key:")) +
+    
+    geom_richtext(data = data2, aes(x = department, y = Percentage, group = Category,
+                                label = glue::glue("{Percentage}%<br>({Count}/{Total})")),
+                  fill = NA,
+                  label.color = NA,
+                  position = position_dodge(width = .9),
+                  hjust = 0.5,
+                  vjust = 0.5, #-0.2, #1
+                  size = case_when(n_distinct(data2$month) == 1 ~ 2.9,
+                          (n_distinct(data2$month) > 1 & n_distinct(data2$month) <= 3) ~ 2,
+                          (n_distinct(data2$month) > 3 & n_distinct(data2$month) <= 6) ~ 1.9,
+                          n_distinct(data2$month) > 6 ~ 1.8)) +
+    
+    scale_fill_manual(values = c("Above benchmark" = "#028A0F", "Below benchmark but above 50" = "orange", "Below benchmark and below 50" = "red"))
+
+
+```
+
+
+
+```{r exporting-graphs & tables, warning=FALSE}
+
+# Duration
+min_quarter <- paste0("Q", min(unique(quarter(data1$discharge_date))))
+max_quarter <- paste0("Q", max(unique(quarter(data1$discharge_date))))
+year <- unique(year(data1$discharge_date))
+
+# Exporting
+read_pptx(here("Template.pptx")) %>%
+  
+  ph_with(value = block_list(fpar(ftext(glue("Timeliness in returning Discharge files to Medical Records
+                                           {min_quarter} - {max_quarter} {year}"),
+                                              prop = fp_text(font.size = 18, font.family = "Helvetica")),
+                                        fp_p = fp_par(text.align = "center"))),
+                location = ph_location_type(type = "subTitle")) %>%
+  
+  add_slide(layout = "Title and Content", master = "Office Theme") %>%
+  ph_with(graph_table, location = ph_location_fullsize()) %>% 
+  
+  add_slide(layout = "Title and Content", master = "Office Theme") %>% 
+  ph_with(graph, location = ph_location_fullsize()) %>%
+  
+  print(here("./Graphs & Pictures/Check in Check out.pptx"))
+
+```
+
+
+
+
+```{r, warning=FALSE, echo=FALSE, eval=FALSE}
+# if(file.exists("../Graphs & Pictures/Table.png")){
+#   
+#   file.remove("../Graphs & Pictures/Table.png")
+#   
+# }
+# 
+# gtsave(data = graph_table, "../Graphs & Pictures/Table.png", zoom = 10)
+
+```
+
